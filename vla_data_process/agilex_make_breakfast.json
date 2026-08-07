@@ -1,0 +1,40 @@
+{
+  "task_id": "agilex_make_breakfast",
+  "global_task": "Pick up the bread from the bread rack and put it in the toaster and press the button on the toaster, then pour some drink from the water bottle into the cup, and finally pick up the toasted bread and place it on the plate.",
+  "sub_tasks": [
+    {
+      "id": "load_bread_into_toaster",
+      "description": "Pick up all bread pieces from the bread rack and insert them into the toaster.",
+      "completion_criteria": [
+        "All bread pieces from the bread rack have been inserted into the toaster.",
+        "The right gripper no longer holds any bread."
+      ]
+    },
+    {
+      "id": "activate_toaster",
+      "description": "Push down the toaster's front lever to activate the toaster, then return the right gripper to its initial resting configuration.",
+      "completion_criteria": [
+        "The toaster's front lever remains in its lowered, activated position.",
+        "The right gripper has withdrawn after activating the toaster and stopped moving."
+      ]
+    },
+    {
+      "id": "pour_drink_into_cup",
+      "description": "Pour drink from the water bottle into the cup, return the bottle upright, and return the left gripper to its initial resting configuration.",
+      "completion_criteria": [
+        "Drink has been poured into the cup and pouring has stopped.",
+        "The water bottle has been returned upright.",
+        "The left gripper has withdrawn after pouring the drink and stopped moving."
+      ]
+    },
+    {
+      "id": "place_toasted_bread_on_plate",
+      "description": "Remove all toasted bread from the toaster and place it on the plate.",
+      "completion_criteria": [
+        "All toasted bread has been removed from the toaster.",
+        "All toasted bread has been released onto the plate.",
+        "The right gripper has withdrawn after placing the bread and stopped moving."
+      ]
+    }
+  ]
+}

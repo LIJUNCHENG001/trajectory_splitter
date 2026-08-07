@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.log
+
+# Generated pipeline and dataset outputs
+output/
+*.building/
+.state_visualiser/
+visualiser_workspace/
+
