@@ -101,3 +101,50 @@ State Visualiser 的业务代码。
 `vla_data_process/` 会读取规则切分生成的逐 episode JSON，把每个有效 subtask
 物理裁成独立的 LeRobot v2.1 episode，同时裁剪三路视频并重建元数据。详细命令见
 `vla_data_process/README.md`。
+
+## 去除开头静止段
+
+先只检测切点并检查 CSV：
+
+    python trim_initial_stationary.py \
+      --source /path/to/lerobot_dataset \
+      --detect-only \
+      --report /path/to/trim_points.csv
+
+确认后直接自动检测并导出，或者编辑 CSV 中的 `trim_frame` 后通过 `--cuts` 使用
+人工切点：
+
+    python trim_initial_stationary.py \
+      --source /path/to/lerobot_dataset \
+      --output /path/to/trimmed_dataset \
+      --cuts /path/to/trim_points.csv \
+      --workers 2
+
+导出会同步裁剪 Parquet 和全部视频，重置帧索引与时间戳，并重建 LeRobot v2.1
+元数据。自动切点只依据 observation 中的实际关节和夹爪运动，不使用可能提前
+变化的 action。原始数据始终只读，输出目录必须不存在且不能位于原始数据目录内。
+
+## 完整早餐数据清洗流程
+
+一条命令先去掉开头静止帧，再筛除插面包过程中有长时间内部停顿的 episode：
+
+    /root/miniconda3/envs/lingbotvla-v2/bin/python clean_breakfast_dataset.py \
+      --source /path/to/source_dataset \
+      --trimmed-output /path/to/trimmed_dataset \
+      --output /path/to/cleaned_dataset \
+      --workers 2
+
+异常规则使用右臂末端 XYZ（7 帧平滑）。松夹前最高 Z 点到松夹之间，末端速度
+低于 10.5 mm/s 且连续至少 1 秒的内部停顿会使整个 episode 被排除。延续至松夹
+的尾部停顿不计，episode 前 0.2 秒内开始的停顿也不计。清洗后的 episode 会重新
+连续编号，Parquet、视频和元数据保持一致；被排除记录位于
+`meta/removed_hesitation_episodes.csv`，旧编号可通过 `meta/source_mapping.jsonl`
+追溯。原始数据不会被修改；cleaned 数据集成功导出并校验后，中间的
+`trimmed-output` 会被自动删除。若异常筛除失败，则保留中间数据方便重跑。
+
+只检测、不导出数据集：
+
+    /root/miniconda3/envs/lingbotvla-v2/bin/python remove_hesitation_episodes.py \
+      --source /path/to/trimmed_dataset \
+      --detect-only \
+      --report /path/to/hesitation_candidates.csv
