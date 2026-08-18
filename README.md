@@ -14,6 +14,14 @@ split JSON、切点分布图以及 State Visualiser 工作区。所有代码都�
 信号先做 5 帧滑动平均。普通 motor 突变阈值为 0.05；第4点以各 motor
 末尾8帧的中位数为基线，大幅变化阈值为 0.12。
 
+切分前还会做采集连续性质检。对 `state[t] -> state[t+1]`，若任一关节的绝对
+变化量至少为 0.3，且 12 维 state 变化量与同步 action 关节变化量的欧氏距离
+之比至少为 5，则判定为录制跳接并剔除该 episode。使用单关节阈值可避免多个
+关节的正常快速运动在 12 维欧氏距离中累加成误报；同步 action 比值可放行 action
+同时变化的真实快速动作。剔除记录写入 `cut_points.csv` 的 `rejected` 行以及
+`split_summary.json` 的 `rejected` 列表；质检剔除不会中断其余 episode 的
+pipeline。
+
 ## 一条命令运行完整 pipeline
 
     cd /home/geek/share3/demo-7.29/projects/trajectory_splitter

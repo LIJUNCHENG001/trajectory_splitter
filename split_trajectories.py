@@ -18,6 +18,7 @@ DEFAULT_DATASET = Path("/home/geek/share3/agilex_make_breakfast_380")
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "output"
 JOINT_COLUMN = "observation.state.joint"
 GRIPPER_COLUMN = "observation.gripper_position"
+ACTION_COLUMN = "actions"
 SEGMENT_LABELS = [
     "阶段1_切分点1前",
     "阶段2_切分点1至2",
@@ -38,6 +39,12 @@ class Config:
     gripper_drop: float = 0.12
     gripper_reopen: float = 0.12
     gripper_peak_slack: float = 0.01
+    max_single_joint_step: float = 0.3
+    min_joint_action_ratio: float = 5.0
+
+
+class RecordingDiscontinuity(ValueError):
+    """Raised when consecutive robot states imply a recording jump."""
 
 
 @dataclass(frozen=True)
@@ -186,11 +193,44 @@ def find_two_motor_reverse_change(
     return candidates[1][0], [candidates[0][1], candidates[1][1]]
 
 
+def reject_recording_discontinuity(
+    joints: np.ndarray, action_joints: np.ndarray, config: Config
+) -> None:
+    """Reject an episode with an implausible one-frame joint-state jump."""
+    if len(joints) < 2:
+        return
+    joint_deltas = np.diff(joints, axis=0)
+    joint_steps = np.linalg.norm(joint_deltas, axis=1)
+    max_single_joint_steps = np.max(np.abs(joint_deltas), axis=1)
+    action_steps = np.linalg.norm(np.diff(action_joints, axis=0), axis=1)
+    ratios = np.divide(
+        joint_steps,
+        action_steps,
+        out=np.full_like(joint_steps, np.inf),
+        where=action_steps > 0,
+    )
+    candidates = np.flatnonzero(
+        (max_single_joint_steps >= config.max_single_joint_step)
+        & (ratios >= config.min_joint_action_ratio)
+    )
+    if len(candidates):
+        frame = int(candidates[np.argmax(joint_steps[candidates])])
+        raise RecordingDiscontinuity(
+            f"joint-state jump {joint_steps[frame]:.6f}, max single-joint jump "
+            f"{max_single_joint_steps[frame]:.6f}, action jump "
+            f"{action_steps[frame]:.6f} (ratio {ratios[frame]:.2f}) at frame "
+            f"{frame}->{frame + 1}"
+        )
+
+
 def detect_cuts(
     table, config: Config, joint_names: list[str], gripper_names: list[str]
 ) -> tuple[Cuts, int, dict[str, str]]:
     joints = np.asarray(table[JOINT_COLUMN].to_pylist(), dtype=float)
     grippers = np.asarray(table[GRIPPER_COLUMN].to_pylist(), dtype=float)
+    actions = np.asarray(table[ACTION_COLUMN].to_pylist(), dtype=float)
+    action_joints = np.concatenate((actions[:, :6], actions[:, 7:13]), axis=1)
+    reject_recording_discontinuity(joints, action_joints, config)
     left_names = [name for name in joint_names if name.endswith("_left")]
     right_names = [name for name in joint_names if name.endswith("_right")]
     left_joints = joints[:, [joint_names.index(name) for name in left_names]]
@@ -343,6 +383,10 @@ def main() -> int:
                     "split_files": files,
                 }
             )
+        except RecordingDiscontinuity as error:
+            row["status"] = "rejected"
+            row["error"] = str(error)
+            print(f"  质检剔除：{row['error']}", file=sys.stderr)
         except Exception as error:
             row["error"] = f"{type(error).__name__}: {error}"
             print(f"  失败：{row['error']}", file=sys.stderr)
@@ -355,7 +399,8 @@ def main() -> int:
                 "dataset": str(args.dataset.resolve()),
                 "config": asdict(config),
                 "episodes": details,
-                "errors": [row for row in rows if row["status"] != "ok"],
+                "rejected": [row for row in rows if row["status"] == "rejected"],
+                "errors": [row for row in rows if row["status"] == "error"],
             },
             ensure_ascii=False,
             indent=2,
@@ -375,8 +420,13 @@ def main() -> int:
         ) + "\n",
         encoding="utf-8",
     )
-    failed = sum(row["status"] != "ok" for row in rows)
-    print(f"完成：成功 {len(rows) - failed}，失败 {failed}，输出 {args.output}")
+    rejected = sum(row["status"] == "rejected" for row in rows)
+    failed = sum(row["status"] == "error" for row in rows)
+    succeeded = len(rows) - rejected - failed
+    print(
+        f"完成：成功 {succeeded}，质检剔除 {rejected}，失败 {failed}，"
+        f"输出 {args.output}"
+    )
     return 1 if failed else 0
 
 
