@@ -118,6 +118,8 @@ def load_segments(
         if episode_meta is None:
             raise ValueError(f"{annotation_path}: episode is missing from episodes.jsonl")
         episode_length = int(episode_meta["length"])
+        # task_end is a status-only marker; VLA segmentation intentionally uses
+        # only the four intervals under sub_task.
         labels = annotation.get("sub_task", {})
         descriptions = labels.get("subtask", [])
         starts = labels.get("start_frame", [])

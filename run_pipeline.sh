@@ -3,7 +3,6 @@ set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 default_python="/root/miniconda3/envs/wam/bin/python"
-default_visualiser="/home/geek/share3/demo-7.29/projects/state_visualiser"
 
 usage() {
   cat <<EOF
@@ -19,9 +18,6 @@ usage() {
   --reuse-summary         不重新自动检测；使用 OUTPUT/split_summary.json 中人工修改的 cut_times
   --max-episodes N        仅处理前 N 条，用于快速测试
   --python PATH           Python 解释器（默认优先使用 wam 环境）
-  --state-visualiser PATH State Visualiser 项目目录
-  --start-visualiser      pipeline 完成后立即启动可视化服务
-  --port PORT             可视化端口，默认 8000
   -h, --help              显示帮助
 
 输出结构：
@@ -29,20 +25,15 @@ usage() {
   OUTPUT/parquet/                     五段 parquet
   OUTPUT/cut_points.csv
   OUTPUT/split_summary.json
-  OUTPUT/cut_point_distributions/     四张分布图与统计
-  OUTPUT/visualiser_workspace/        State Visualiser 工作区
 EOF
 }
 
 dataset=""
 output=""
 python_bin="${PYTHON_BIN:-}"
-state_visualiser="${STATE_VIS_APP_DIR:-$default_visualiser}"
 overwrite=0
 reuse_summary=0
-start_visualiser=0
 max_episodes=""
-port="${PORT:-8000}"
 
 while (($#)); do
   case "$1" in
@@ -61,16 +52,6 @@ while (($#)); do
       python_bin="$2"
       shift 2
       ;;
-    --state-visualiser)
-      [[ $# -ge 2 ]] || { echo "错误：--state-visualiser 缺少路径" >&2; exit 2; }
-      state_visualiser="$2"
-      shift 2
-      ;;
-    --port)
-      [[ $# -ge 2 ]] || { echo "错误：--port 缺少数值" >&2; exit 2; }
-      port="$2"
-      shift 2
-      ;;
     --max-episodes)
       [[ $# -ge 2 ]] || { echo "错误：--max-episodes 缺少数值" >&2; exit 2; }
       max_episodes="$2"
@@ -82,10 +63,6 @@ while (($#)); do
       ;;
     --reuse-summary)
       reuse_summary=1
-      shift
-      ;;
-    --start-visualiser)
-      start_visualiser=1
       shift
       ;;
     -h|--help)
@@ -114,8 +91,6 @@ if [[ "$output" == "$dataset" || "$output" == "$dataset/"* ]]; then
   exit 2
 fi
 mkdir -p "$output"
-export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-trajectory-splitter}"
-mkdir -p "$MPLCONFIGDIR"
 
 if [[ -z "$python_bin" ]]; then
   if [[ -x "$default_python" ]]; then
@@ -125,13 +100,13 @@ if [[ -z "$python_bin" ]]; then
   fi
 fi
 [[ -x "$python_bin" ]] || { echo "错误：Python 不可执行：$python_bin" >&2; exit 2; }
-"$python_bin" -c "import matplotlib, numpy, pandas, pyarrow" || {
+"$python_bin" -c "import numpy, pyarrow" || {
   echo "错误：Python 环境缺少依赖，请安装 $project_dir/requirements.txt" >&2
   exit 2
 }
 
 if ((reuse_summary == 0)); then
-  echo "[1/4] 自动检测切点并生成 parquet 分段"
+  echo "[1/2] 自动检测切点并生成 parquet 分段"
   split_args=(
     "$project_dir/split_trajectories.py"
     --dataset "$dataset"
@@ -141,51 +116,22 @@ if ((reuse_summary == 0)); then
   [[ -n "$max_episodes" ]] && split_args+=(--max-episodes "$max_episodes")
   "$python_bin" "${split_args[@]}"
 else
-  echo "[1/4] 使用已有 split_summary.json（保留人工 cut_times）"
+  echo "[1/2] 使用已有 split_summary.json（保留人工 cut_times）"
   [[ -f "$output/split_summary.json" ]] || {
     echo "错误：找不到 $output/split_summary.json" >&2
     exit 2
   }
 fi
 
-echo "[2/4] 生成 split JSON，并同步人工 cut_times 对应的 frame"
+echo "[2/2] 生成 split JSON，并同步人工 cut_times 对应的 frame"
 "$python_bin" "$project_dir/sync_manual_cut_times.py" \
   --dataset "$dataset" \
   --summary "$output/split_summary.json" \
   --cut-points "$output/cut_points.csv" \
-  --visualiser-segments "$output/visualiser_segments.json" \
   --split-output "$output/split" \
   --parquet-output "$output/parquet"
-
-echo "[3/4] 生成四个切点的分布图和统计"
-"$python_bin" "$project_dir/plot_cut_distributions.py" \
-    --input "$output/cut_points.csv" \
-    --output "$output/cut_point_distributions"
-
-echo "[4/4] 生成 State Visualiser 工作区"
-"$python_bin" "$project_dir/prepare_visualiser_workspace.py" \
-  --dataset "$dataset" \
-  --segments "$output/visualiser_segments.json" \
-  --workspace "$output/visualiser_workspace"
 
 echo
 echo "Pipeline 完成"
 echo "  原始数据：$dataset"
 echo "  split JSON：$output/split"
-echo "  分布图：$output/cut_point_distributions"
-echo "  可视化工作区：$output/visualiser_workspace"
-
-visualiser_command=(
-  "$project_dir/start_visualiser.sh"
-  --dataset "$dataset"
-  --output "$output"
-  --state-visualiser "$state_visualiser"
-  --port "$port"
-)
-if ((start_visualiser)); then
-  exec "${visualiser_command[@]}"
-fi
-
-printf "启动可视化："
-printf " %q" "${visualiser_command[@]}"
-printf "\n"

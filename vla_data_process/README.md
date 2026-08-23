@@ -8,6 +8,10 @@ outside `split/*/sub_task` are omitted. Splitting at every sub-task boundary is
 intentional: it prevents an action horizon conditioned on one instruction from
 crossing into the next instruction.
 
+The optional top-level `task_end` marker in a split JSON is used only for task-state
+judgment. It is intentionally ignored here and never creates or shortens a VLA
+training episode.
+
 The output keeps:
 
 - all three camera views;

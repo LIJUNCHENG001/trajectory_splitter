@@ -10,6 +10,7 @@ from split_trajectories import (
     RecordingDiscontinuity,
     find_arm_stop_from_action_and_state,
     find_gripper_closures,
+    find_optional_task_end,
     find_release_distance_cut,
     find_sustained_arm_motion_start,
     reject_early_arm_overlap,
@@ -249,6 +250,42 @@ class ArmReturnTest(unittest.TestCase):
         )
 
         self.assertEqual(frame, 61)
+
+    def test_task_end_reuses_right_arm_stop_rule(self) -> None:
+        actions = np.zeros((120, 1))
+        actions[50:71, 0] = np.arange(21) * 0.02
+        actions[71:, 0] = 0.4
+        states = np.zeros((120, 1))
+        states[53:75, 0] = np.arange(22) * 0.02
+        states[75:, 0] = 0.42
+
+        frame, motors, error = find_optional_task_end(
+            actions,
+            states,
+            ["motor_0_right"],
+            Config(fps=30, smooth_frames=1),
+            cut4=40,
+        )
+
+        self.assertEqual(frame, 89)
+        self.assertEqual(motors, ["motor_0_right"])
+        self.assertEqual(error, "")
+
+    def test_missing_task_end_does_not_fail_split_detection(self) -> None:
+        actions = np.zeros((80, 1))
+        actions[50:80, 0] = np.arange(30) * 0.02
+
+        frame, motors, error = find_optional_task_end(
+            actions,
+            actions,
+            ["motor_0_right"],
+            Config(fps=30, smooth_frames=1),
+            cut4=40,
+        )
+
+        self.assertIsNone(frame)
+        self.assertEqual(motors, [])
+        self.assertIn("no sustained stop", error)
 
 
 if __name__ == "__main__":

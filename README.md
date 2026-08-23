@@ -1,8 +1,8 @@
 # Trajectory Splitter
 
 该项目根据四个动作事件把 LeRobot v2.1 轨迹切成五段，并自动生成训练使用的
-split JSON、切点分布图以及 State Visualiser 工作区。所有代码都位于本目录，
-原始数据只读，输出统一写入运行时指定的目录。
+split JSON 和 parquet 数据。所有代码都位于本目录，原始数据只读，输出统一
+写入运行时指定的目录。
 
 ## 切点规则
 
@@ -27,6 +27,12 @@ XYZ为基准，在随后1秒内首次达到三维欧氏位移0.10米的位置作
 持续至少0.5秒的有效动作，再用左臂 state 确定实际停止位置。action 与 state 不做
 固定帧数补偿；state 停止后同样要求连续静止至少0.5秒，切点取静止窗口末端，
 以便切点帧明确呈现已完成状态。
+
+另在第4点之后检测独立的 `task_end` 状态点：选择右臂最后一段持续至少0.5秒的
+有效 action 动作，再用右臂 state 确认持续静止至少0.5秒，静止开始后延迟0.5秒
+作为任务完成时刻。该状态点写入 `cut_points.csv`、`split_summary.json` 和逐 episode
+split JSON，但不参与四个任务边界、五段 parquet 或子任务训练数据切分。视频尾部
+不足以完成高置信确认时记为 `unavailable`，不影响原有切分成功。
 
 另对第3、4点做对称的双臂时序质检：如果一侧手臂开始稳定时，另一侧手臂已处于
 连续至少0.5秒的有效 action 动作中，且另一侧比回位稳定提前超过1.0秒启动，
@@ -74,10 +80,7 @@ pipeline。
     ├── split/                         # 逐 episode 的训练 JSON
     ├── parquet/                       # episode_xxxxxx/segment_01..05.parquet
     ├── cut_points.csv
-    ├── split_summary.json
-    ├── visualiser_segments.json
-    ├── cut_point_distributions/       # 4张PNG及CSV/JSON统计
-    └── visualiser_workspace/          # State Visualiser 工作区
+    └── split_summary.json
 
 ## 人工修改 cut_times 后重新同步
 
@@ -89,29 +92,8 @@ pipeline。
       --output /path/to/pipeline_output \
       --reuse-summary
 
-它会按真实 timestamp 找最近帧，同步 cut_frames、split JSON、相关 parquet、
-分布图和可视化工作区，并在 manual_sync_backups/ 中备份修改前文件。
-
-## State Visualiser
-
-完整 pipeline 会自动创建适配工作区。启动方式：
-
-    ./start_visualiser.sh \
-      --dataset /path/to/lerobot_dataset \
-      --output /path/to/pipeline_output \
-      --port 8000
-
-也可以在 pipeline 完成后立即启动：
-
-    ./run_pipeline.sh \
-      --dataset /path/to/lerobot_dataset \
-      --output /path/to/pipeline_output \
-      --start-visualiser
-
-浏览器访问 http://localhost:8000。启动脚本会把数据集、工作区、标注文件和
-允许访问的公共根目录传给
-/home/geek/share3/demo-7.29/projects/state_visualiser，因此不需要修改
-State Visualiser 的业务代码。
+它会按真实 timestamp 找最近帧，同步 cut_frames、split JSON 和相关 parquet，
+并在 manual_sync_backups/ 中备份修改前文件。
 
 ## 单独运行组件
 
@@ -119,8 +101,6 @@ State Visualiser 的业务代码。
 
     /root/miniconda3/envs/wam/bin/python split_trajectories.py --help
     /root/miniconda3/envs/wam/bin/python sync_manual_cut_times.py --help
-    /root/miniconda3/envs/wam/bin/python plot_cut_distributions.py --help
-    /root/miniconda3/envs/wam/bin/python prepare_visualiser_workspace.py --help
 
 ## 生成 subtask 训练数据集
 

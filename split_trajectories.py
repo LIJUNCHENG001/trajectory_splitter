@@ -20,13 +20,6 @@ JOINT_COLUMN = "observation.state.joint"
 GRIPPER_COLUMN = "observation.gripper_position"
 END_STATE_COLUMN = "observation.state.end"
 ACTION_COLUMN = "actions"
-SEGMENT_LABELS = [
-    "阶段1_切分点1前",
-    "阶段2_切分点1至2",
-    "阶段3_切分点2至3",
-    "阶段4_切分点3至4",
-    "阶段5_切分点4后",
-]
 
 
 @dataclass(frozen=True)
@@ -91,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--detect-only",
         action="store_true",
-        help="Write summaries/visualiser annotations without split parquet files.",
+        help="Write cut summaries without split parquet files.",
     )
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
@@ -329,6 +322,29 @@ def find_arm_stop_from_action_and_state(
     return frame, motors
 
 
+def find_optional_task_end(
+    right_actions: np.ndarray,
+    right_states: np.ndarray,
+    right_names: list[str],
+    config: Config,
+    *,
+    cut4: int,
+) -> tuple[int | None, list[str], str]:
+    """Detect the final right-arm return without affecting trajectory splitting."""
+    try:
+        frame, motors = find_arm_stop_from_action_and_state(
+            right_actions,
+            right_states,
+            right_names,
+            config,
+            motion_search_start=cut4 + 1,
+            motion_start_before=len(right_states),
+        )
+        return frame, motors, ""
+    except ValueError as error:
+        return None, [], str(error)
+
+
 def reject_early_arm_overlap(
     action_signals: np.ndarray,
     returning_stable_start: int,
@@ -388,7 +404,7 @@ def reject_recording_discontinuity(
 
 def detect_cuts(
     table, config: Config, joint_names: list[str], gripper_names: list[str]
-) -> tuple[Cuts, int, dict[str, str]]:
+) -> tuple[Cuts, int | None, int, dict[str, str]]:
     joints = np.asarray(table[JOINT_COLUMN].to_pylist(), dtype=float)
     grippers = np.asarray(table[GRIPPER_COLUMN].to_pylist(), dtype=float)
     end_states = np.asarray(table[END_STATE_COLUMN].to_pylist(), dtype=float)
@@ -405,8 +421,7 @@ def detect_cuts(
     right_gripper_action = actions[:, 13]
 
     cut1, cut1_motor = find_any_motor_mutation(right_joints, right_names, config)
-    # The visualiser cannot represent an empty 0–0 s segment when motion
-    # already exists in the first smoothed window.
+    # Keep the first segment non-empty when motion exists in the first window.
     cut1 = max(1, cut1)
     closures, contact_closures, contact_release_frames = find_gripper_closures(
         right_gripper, right_gripper_action, config
@@ -464,8 +479,16 @@ def detect_cuts(
     cuts = Cuts(cut1, cut2, cut3, cut4)
     if cuts.indices() != sorted(cuts.indices()) or len(set(cuts.indices())) != 4:
         raise ValueError(f"cut points are not strictly increasing: {cuts.indices()}")
+    task_end, task_end_motors, task_end_error = find_optional_task_end(
+        right_actions,
+        right_joints,
+        right_names,
+        config,
+        cut4=cut4,
+    )
     return (
         cuts,
+        task_end,
         len(closures),
         {
             "cut1_motor": cut1_motor,
@@ -473,6 +496,8 @@ def detect_cuts(
             "cut3_left_start_motor": cut3_motor,
             "cut3_left_start_frame": str(left_start),
             "cut4_motors": ",".join(cut4_motors),
+            "task_end_motors": ",".join(task_end_motors),
+            "task_end_error": task_end_error,
         },
     )
 
@@ -493,28 +518,6 @@ def write_segments(
     return written
 
 
-def annotation_segments(
-    timestamps: np.ndarray, row_count: int, cuts: Cuts, fps: float
-) -> list[dict]:
-    boundaries = [0, *cuts.indices(), row_count]
-    duration = row_count / fps
-    segments = []
-    for number, (start, end, label) in enumerate(
-        zip(boundaries, boundaries[1:], SEGMENT_LABELS), 1
-    ):
-        start_time = float(timestamps[start]) if start < row_count else duration
-        end_time = float(timestamps[end]) if end < row_count else duration
-        segments.append(
-            {
-                "id": f"auto_segment_{number}",
-                "start": round(start_time, 6),
-                "end": round(end_time, 6),
-                "label": label,
-            }
-        )
-    return segments
-
-
 def write_csv(path: Path, rows: list[dict]) -> None:
     fields = [
         "episode_index",
@@ -532,6 +535,11 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         "cut4_frame",
         "cut4_time",
         "cut4_motors",
+        "task_end_status",
+        "task_end_frame",
+        "task_end_time",
+        "task_end_motors",
+        "task_end_error",
         "right_gripper_closures",
         "error",
     ]
@@ -563,7 +571,6 @@ def main() -> int:
 
     args.output.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
-    annotations: dict[str, list[dict]] = {}
     details: list[dict] = []
 
     for position, path in enumerate(paths, 1):
@@ -573,10 +580,13 @@ def main() -> int:
         try:
             table = pq.read_table(path)
             timestamps = np.asarray(table["timestamp"], dtype=float)
-            cuts, closure_count, trigger_sources = detect_cuts(
+            cuts, task_end, closure_count, trigger_sources = detect_cuts(
                 table, config, joint_names, gripper_names
             )
             cut_times = [float(timestamps[index]) for index in cuts.indices()]
+            task_end_time = (
+                float(timestamps[task_end]) if task_end is not None else None
+            )
             row.update(
                 {
                     "status": "ok",
@@ -593,11 +603,15 @@ def main() -> int:
                     "cut4_frame": cuts.indices()[3],
                     "cut4_time": cut_times[3],
                     "cut4_motors": trigger_sources["cut4_motors"],
+                    "task_end_status": (
+                        "ok" if task_end is not None else "unavailable"
+                    ),
+                    "task_end_frame": task_end,
+                    "task_end_time": task_end_time,
+                    "task_end_motors": trigger_sources["task_end_motors"],
+                    "task_end_error": trigger_sources["task_end_error"],
                     "right_gripper_closures": closure_count,
                 }
-            )
-            annotations[str(episode_index)] = annotation_segments(
-                timestamps, table.num_rows, cuts, config.fps
             )
             files = (
                 []
@@ -612,8 +626,14 @@ def main() -> int:
                     "source": str(path),
                     "cut_frames": cuts.indices(),
                     "cut_times": cut_times,
+                    "task_end": {
+                        "status": "ok" if task_end is not None else "unavailable",
+                        "frame": task_end,
+                        "time": task_end_time,
+                        "motors": trigger_sources["task_end_motors"],
+                        "error": trigger_sources["task_end_error"],
+                    },
                     "trigger_sources": trigger_sources,
-                    "segments": annotations[str(episode_index)],
                     "split_files": files,
                 }
             )
@@ -635,20 +655,6 @@ def main() -> int:
                 "episodes": details,
                 "rejected": [row for row in rows if row["status"] == "rejected"],
                 "errors": [row for row in rows if row["status"] == "error"],
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    (args.output / "visualiser_segments.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "source_dataset": str(args.dataset.resolve()),
-                "output_dataset": str(args.dataset.resolve()),
-                "episodes": annotations,
             },
             ensure_ascii=False,
             indent=2,

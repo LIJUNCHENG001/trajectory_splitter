@@ -18,13 +18,6 @@ import pyarrow.parquet as pq
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATASET = Path("/home/geek/share3/agilex_make_breakfast_380")
 DEFAULT_OUTPUT = PROJECT_DIR / "output"
-SEGMENT_LABELS = [
-    "阶段1_切分点1前",
-    "阶段2_切分点1至2",
-    "阶段3_切分点2至3",
-    "阶段4_切分点3至4",
-    "阶段5_切分点4后",
-]
 REWARD_KEYS = [
     "success",
     "failure",
@@ -59,11 +52,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cut-points", type=Path, default=None
-    )
-    parser.add_argument(
-        "--visualiser-segments",
-        type=Path,
-        default=None,
     )
     parser.add_argument(
         "--split-output", type=Path, default=None
@@ -108,31 +96,15 @@ def nearest_frames(timestamps: np.ndarray, cut_times: list[float]) -> list[int]:
     return frames
 
 
-def make_segments(cut_times: list[float], duration: float) -> list[dict]:
-    boundaries = [0.0, *cut_times, duration]
-    if any(left >= right for left, right in zip(boundaries, boundaries[1:])):
-        raise ValueError(f"cut times are not strictly increasing: {cut_times}")
-    return [
-        {
-            "id": f"auto_segment_{number}",
-            "start": round(start, 6),
-            "end": round(end, 6),
-            "label": label,
-        }
-        for number, (start, end, label) in enumerate(
-            zip(boundaries, boundaries[1:], SEGMENT_LABELS), 1
-        )
-    ]
-
-
 def make_split_json(
     episode_index: int,
     cut_times: list[float],
     cut_frames: list[int],
     duration: float,
     frame_count: int,
+    task_end: dict | None = None,
 ) -> dict:
-    return {
+    payload = {
         "index": episode_index,
         "name": f"episode_{episode_index:06d}.mp4",
         "sub_task": {
@@ -155,6 +127,9 @@ def make_split_json(
         },
         "reward": {key: [] for key in REWARD_KEYS},
     }
+    if task_end is not None:
+        payload["task_end"] = task_end
+    return payload
 
 
 def rewrite_parquet_segments(
@@ -174,9 +149,6 @@ def main() -> int:
     args = parse_args()
     args.summary = args.summary or args.output / "split_summary.json"
     args.cut_points = args.cut_points or args.output / "cut_points.csv"
-    args.visualiser_segments = (
-        args.visualiser_segments or args.output / "visualiser_segments.json"
-    )
     args.split_output = args.split_output or args.output / "split"
     args.parquet_output = args.parquet_output or args.output / "parquet"
     info = json.loads((args.dataset / "meta" / "info.json").read_text(encoding="utf-8"))
@@ -185,7 +157,6 @@ def main() -> int:
     summary = json.loads(args.summary.read_text(encoding="utf-8"))
     csv_rows, csv_fields = read_csv(args.cut_points)
     csv_by_episode = {int(row["episode_index"]): row for row in csv_rows}
-    visualiser = json.loads(args.visualiser_segments.read_text(encoding="utf-8"))
 
     changed: list[dict] = []
     prepared: list[tuple[dict, object, list[float], list[int], float]] = []
@@ -232,7 +203,7 @@ def main() -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup = args.summary.parent / "manual_sync_backups" / stamp
     backup.mkdir(parents=True, exist_ok=False)
-    for path in (args.summary, args.cut_points, args.visualiser_segments):
+    for path in (args.summary, args.cut_points):
         shutil.copy2(path, backup / path.name)
     for item in changed:
         split_path = args.split_output / f"episode_{item['episode_index']:06d}.json"
@@ -243,18 +214,21 @@ def main() -> int:
     for episode, table, cut_times, cut_frames, duration in prepared:
         episode_index = int(episode["episode_index"])
         episode["cut_frames"] = cut_frames
-        episode["segments"] = make_segments(cut_times, duration)
         row = csv_by_episode[episode_index]
         for number, (frame, cut_time) in enumerate(
             zip(cut_frames, cut_times), 1
         ):
             row[f"cut{number}_frame"] = frame
             row[f"cut{number}_time"] = cut_time
-        visualiser["episodes"][str(episode_index)] = episode["segments"]
         atomic_json(
             args.split_output / f"episode_{episode_index:06d}.json",
             make_split_json(
-                episode_index, cut_times, cut_frames, duration, table.num_rows
+                episode_index,
+                cut_times,
+                cut_frames,
+                duration,
+                table.num_rows,
+                episode.get("task_end"),
             ),
         )
         if episode_index in changed_indices:
@@ -264,7 +238,6 @@ def main() -> int:
 
     atomic_json(args.summary, summary)
     atomic_csv(args.cut_points, csv_rows, csv_fields)
-    atomic_json(args.visualiser_segments, visualiser)
     print(f"Synchronized outputs; backup: {backup}")
     return 0
 
