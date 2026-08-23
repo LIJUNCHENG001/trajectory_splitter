@@ -18,6 +18,7 @@ DEFAULT_DATASET = Path("/home/geek/share3/agilex_make_breakfast_380")
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "output"
 JOINT_COLUMN = "observation.state.joint"
 GRIPPER_COLUMN = "observation.gripper_position"
+END_STATE_COLUMN = "observation.state.end"
 ACTION_COLUMN = "actions"
 SEGMENT_LABELS = [
     "阶段1_切分点1前",
@@ -34,32 +35,50 @@ class Config:
     smooth_frames: int = 5
     baseline_frames: int = 8
     mutation_change: float = 0.05
-    large_motor_change: float = 0.12
     baseline_tolerance: float = 0.006
     gripper_drop: float = 0.12
     gripper_reopen: float = 0.12
     gripper_peak_slack: float = 0.01
+    gripper_contact_gap: float = 0.02
+    gripper_contact_max_position: float = 0.12
+    cut2_release_distance: float = 0.10
+    cut2_max_search_seconds: float = 1.0
     max_single_joint_step: float = 0.3
     min_joint_action_ratio: float = 5.0
+    arm_stationary_step: float = 0.006
+    left_start_min_motion_seconds: float = 0.5
+    min_action_motion_seconds: float = 0.5
+    min_state_stationary_seconds: float = 0.5
+    state_cut_delay_seconds: float = 0.5
+    max_arm_lead_seconds: float = 1.0
+    cut4_ignore_tail_seconds: float = 5.0
 
 
-class RecordingDiscontinuity(ValueError):
+class EpisodeQualityRejection(ValueError):
+    """Raised when an episode violates a data-quality constraint."""
+
+
+class RecordingDiscontinuity(EpisodeQualityRejection):
     """Raised when consecutive robot states imply a recording jump."""
+
+
+class EarlyArmOverlap(EpisodeQualityRejection):
+    """Raised when the other arm starts too early during an arm return."""
 
 
 @dataclass(frozen=True)
 class Cuts:
     cut1_right_arm_mutation: int
-    cut2_third_right_gripper_close: int
-    cut3_left_arm_mutation: int
-    cut4_two_left_motors_reverse_change: int
+    cut2_bread_release_completion: int
+    cut3_right_arm_return_stop: int
+    cut4_left_arm_return_stop: int
 
     def indices(self) -> list[int]:
         return [
             self.cut1_right_arm_mutation,
-            self.cut2_third_right_gripper_close,
-            self.cut3_left_arm_mutation,
-            self.cut4_two_left_motors_reverse_change,
+            self.cut2_bread_release_completion,
+            self.cut3_right_arm_return_stop,
+            self.cut4_left_arm_return_stop,
         ]
 
 
@@ -93,9 +112,7 @@ def find_mutation(
     start: int,
     config: Config,
     name: str,
-    change: float | None = None,
 ) -> int:
-    threshold = config.mutation_change if change is None else change
     values = smooth(signal, config.smooth_frames)
     baseline_stop = min(len(values), start + config.baseline_frames)
     if baseline_stop - start < 2:
@@ -106,18 +123,24 @@ def find_mutation(
         deviation = abs(values[index] - baseline)
         if deviation <= config.baseline_tolerance:
             last_stable = index
-        if deviation >= threshold:
+        if deviation >= config.mutation_change:
             return last_stable
-    raise ValueError(f"{name}: no change of at least {threshold} found")
+    raise ValueError(f"{name}: no change of at least {config.mutation_change} found")
 
 
-def find_gripper_closures(signal: np.ndarray, config: Config) -> list[int]:
-    """Return closing onset indices using drop/reopen hysteresis."""
+def find_gripper_closures(
+    signal: np.ndarray, action_signal: np.ndarray, config: Config
+) -> tuple[list[int], list[int], list[int]]:
+    """Return closing peaks, contact peaks, and contact-release frames."""
     values = smooth(signal, config.smooth_frames)
+    action_values = smooth(action_signal, config.smooth_frames)
     closures: list[int] = []
+    contact_closures: list[int] = []
+    contact_release_frames: list[int] = []
     armed = True
     peak = trough = float(values[0])
     peak_index = 0
+    action_trough = float(action_values[0])
 
     for index in range(1, len(values)):
         value = float(values[index])
@@ -129,13 +152,48 @@ def find_gripper_closures(signal: np.ndarray, config: Config) -> list[int]:
                 closures.append(peak_index)
                 armed = False
                 trough = value
+                action_trough = float(action_values[index])
         else:
             trough = min(trough, value)
+            action_trough = min(action_trough, float(action_values[index]))
             if value - trough >= config.gripper_reopen:
+                if (
+                    trough <= config.gripper_contact_max_position
+                    and trough - action_trough >= config.gripper_contact_gap
+                ):
+                    contact_closures.append(closures[-1])
+                    contact_release_frames.append(index)
                 armed = True
                 peak = value
                 peak_index = index
-    return closures
+    return closures, contact_closures, contact_release_frames
+
+
+def find_release_distance_cut(
+    positions: np.ndarray, release_frame: int, config: Config
+) -> int:
+    """Return the first frame 10 cm away from the confirmed release position."""
+    values = np.column_stack(
+        [
+            smooth(positions[:, column], config.smooth_frames)
+            for column in range(positions.shape[1])
+        ]
+    )
+    search_stop = min(
+        len(values),
+        release_frame + round(config.cut2_max_search_seconds * config.fps) + 1,
+    )
+    distances = np.linalg.norm(
+        values[release_frame:search_stop] - values[release_frame], axis=1
+    )
+    matches = np.flatnonzero(distances >= config.cut2_release_distance)
+    if not len(matches):
+        raise ValueError(
+            "right arm: does not move "
+            f"{config.cut2_release_distance:.3f}m away from bread within "
+            f"{config.cut2_max_search_seconds:.3f}s after release"
+        )
+    return release_frame + int(matches[0])
 
 
 def find_any_motor_mutation(
@@ -144,53 +202,158 @@ def find_any_motor_mutation(
     config: Config,
     *,
     start: int = 0,
-    reverse: bool = False,
 ) -> tuple[int, str]:
-    """Find the earliest mutation among motors in the requested scan direction."""
+    """Find the earliest mutation among the requested motors."""
     candidates = []
     for column, name in enumerate(names):
-        signal = signals[:, column]
         try:
-            if reverse:
-                reversed_index = find_mutation(signal[::-1], 0, config, name)
-                index = len(signal) - 1 - reversed_index
-            else:
-                index = find_mutation(signal, start, config, name)
+            index = find_mutation(signals[:, column], start, config, name)
             candidates.append((index, name))
         except ValueError:
             continue
     if not candidates:
-        direction = "backward" if reverse else "forward"
-        raise ValueError(f"no motor mutation found while scanning {direction}")
-    selector = max if reverse else min
-    return selector(candidates, key=lambda item: item[0])
+        raise ValueError("no motor mutation found while scanning forward")
+    return min(candidates, key=lambda item: item[0])
 
 
-def find_two_motor_reverse_change(
-    signals: np.ndarray, names: list[str], config: Config
+def find_sustained_arm_motion_start(
+    signals: np.ndarray,
+    names: list[str],
+    config: Config,
+    *,
+    start: int = 0,
+) -> tuple[int, str]:
+    """Return the start of the first sustained visible-speed arm motion."""
+    values = np.column_stack(
+        [
+            smooth(signals[:, column], config.smooth_frames)
+            for column in range(signals.shape[1])
+        ]
+    )
+    steps = np.abs(np.diff(values, axis=0))
+    required_frames = max(1, round(config.left_start_min_motion_seconds * config.fps))
+    run_length = 0
+    for index in range(start, len(steps)):
+        if np.max(steps[index]) >= config.arm_stationary_step:
+            run_length += 1
+            if run_length >= required_frames:
+                first = index - run_length + 1
+                motor_steps = np.max(steps[first : index + 1], axis=0)
+                motor = names[int(np.argmax(motor_steps))]
+                return first, motor
+        else:
+            run_length = 0
+    raise ValueError("arm: no sustained motion found while scanning forward")
+
+
+def find_sustained_action_motion_runs(
+    action_signals: np.ndarray, config: Config
+) -> list[tuple[int, int]]:
+    """Return action-motion runs that last at least the configured duration."""
+    action_values = np.column_stack(
+        [
+            smooth(action_signals[:, column], config.smooth_frames)
+            for column in range(action_signals.shape[1])
+        ]
+    )
+    action_steps = np.abs(np.diff(action_values, axis=0))
+    moving_mask = np.max(action_steps, axis=1) >= config.arm_stationary_step
+    min_motion_frames = max(1, round(config.min_action_motion_seconds * config.fps))
+    motion_runs: list[tuple[int, int]] = []
+    run_start = None
+    for index in range(len(moving_mask) + 1):
+        is_moving = index < len(moving_mask) and moving_mask[index]
+        if is_moving and run_start is None:
+            run_start = index
+        elif not is_moving and run_start is not None:
+            if index - run_start >= min_motion_frames:
+                motion_runs.append((run_start, index - 1))
+            run_start = None
+    return motion_runs
+
+
+def find_arm_stop_from_action_and_state(
+    action_signals: np.ndarray,
+    state_signals: np.ndarray,
+    names: list[str],
+    config: Config,
+    *,
+    motion_search_start: int,
+    motion_start_before: int,
 ) -> tuple[int, list[str]]:
-    """Return the point where a second left motor changes while scanning backward."""
-    candidates = []
-    for column, name in enumerate(names):
-        try:
-            reversed_index = find_mutation(
-                signals[:, column][::-1],
-                0,
-                config,
-                name,
-                change=config.large_motor_change,
-            )
-            index = len(signals) - 1 - reversed_index
-            candidates.append((index, name))
-        except ValueError:
-            continue
-    if len(candidates) < 2:
-        raise ValueError(
-            f"only {len(candidates)} left motors have a reverse change of at least "
-            f"{config.large_motor_change}; need 2"
+    """Use action to select a motion, then cut after its confirmed state stop."""
+    motion_runs = [
+        (run_start, run_end)
+        for run_start, run_end in find_sustained_action_motion_runs(
+            action_signals, config
         )
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[1][0], [candidates[0][1], candidates[1][1]]
+        if run_end >= motion_search_start and run_start < motion_start_before
+    ]
+    if not motion_runs:
+        raise ValueError("arm: no sustained action motion found in the search window")
+
+    _, action_last_moving = motion_runs[-1]
+    state_values = np.column_stack(
+        [
+            smooth(state_signals[:, column], config.smooth_frames)
+            for column in range(state_signals.shape[1])
+        ]
+    )
+    state_steps = np.abs(np.diff(state_values, axis=0))
+    state_motion = np.max(state_steps, axis=1) >= config.arm_stationary_step
+    stationary_steps = max(
+        1, round(config.min_state_stationary_seconds * config.fps) - 1
+    )
+    stable_start = None
+    candidates = range(
+        action_last_moving + 1,
+        len(state_motion) - stationary_steps + 1,
+    )
+    for candidate in candidates:
+        if not np.any(state_motion[candidate : candidate + stationary_steps]):
+            stable_start = candidate
+            break
+    if stable_start is None:
+        raise ValueError("arm: state has no sustained stop after action motion")
+    cut_delay_frames = round(config.state_cut_delay_seconds * config.fps)
+    frame = stable_start + cut_delay_frames
+    if frame >= len(state_values):
+        raise ValueError("arm: confirmed state stop is beyond the episode")
+    previous_motion = np.flatnonzero(state_motion[:stable_start])
+    last_moving = int(previous_motion[-1]) if len(previous_motion) else stable_start
+    motors = [
+        name
+        for column, name in enumerate(names)
+        if state_steps[last_moving, column] >= config.arm_stationary_step
+    ]
+    return frame, motors
+
+
+def reject_early_arm_overlap(
+    action_signals: np.ndarray,
+    returning_stable_start: int,
+    search_start: int,
+    config: Config,
+    *,
+    moving_arm: str,
+    returning_arm: str,
+) -> None:
+    """Reject sustained motion starting too early before the other arm is stable."""
+    max_lead_frames = round(config.max_arm_lead_seconds * config.fps)
+    for run_start, run_end in find_sustained_action_motion_runs(action_signals, config):
+        if (
+            run_end < search_start
+            or not run_start <= returning_stable_start <= run_end
+        ):
+            continue
+        lead_frames = returning_stable_start - run_start
+        if lead_frames > max_lead_frames:
+            raise EarlyArmOverlap(
+                f"{moving_arm} arm starts {lead_frames / config.fps:.3f}s before "
+                f"{returning_arm} arm return stability "
+                f"(frames {run_start}->{returning_stable_start}), exceeds "
+                f"{config.max_arm_lead_seconds:.3f}s"
+            )
 
 
 def reject_recording_discontinuity(
@@ -228,6 +391,7 @@ def detect_cuts(
 ) -> tuple[Cuts, int, dict[str, str]]:
     joints = np.asarray(table[JOINT_COLUMN].to_pylist(), dtype=float)
     grippers = np.asarray(table[GRIPPER_COLUMN].to_pylist(), dtype=float)
+    end_states = np.asarray(table[END_STATE_COLUMN].to_pylist(), dtype=float)
     actions = np.asarray(table[ACTION_COLUMN].to_pylist(), dtype=float)
     action_joints = np.concatenate((actions[:, :6], actions[:, 7:13]), axis=1)
     reject_recording_discontinuity(joints, action_joints, config)
@@ -235,35 +399,87 @@ def detect_cuts(
     right_names = [name for name in joint_names if name.endswith("_right")]
     left_joints = joints[:, [joint_names.index(name) for name in left_names]]
     right_joints = joints[:, [joint_names.index(name) for name in right_names]]
+    left_actions = actions[:, :6]
+    right_actions = actions[:, 7:13]
     right_gripper = grippers[:, gripper_names.index("right_gripper_percent")]
+    right_gripper_action = actions[:, 13]
 
-    cut1, cut1_motor = find_any_motor_mutation(
-        right_joints, right_names, config
-    )
+    cut1, cut1_motor = find_any_motor_mutation(right_joints, right_names, config)
     # The visualiser cannot represent an empty 0–0 s segment when motion
     # already exists in the first smoothed window.
     cut1 = max(1, cut1)
-    closures = find_gripper_closures(right_gripper, config)
-    if len(closures) < 3:
-        raise ValueError(f"right gripper: found {len(closures)} closures, need 3")
-    cut2 = closures[2]
-    cut3, cut3_motor = find_any_motor_mutation(
-        left_joints, left_names, config, start=cut2 + 1
+    closures, contact_closures, contact_release_frames = find_gripper_closures(
+        right_gripper, right_gripper_action, config
     )
-    cut4, cut4_motors = find_two_motor_reverse_change(
-        left_joints, left_names, config
+    if len(contact_closures) < 2:
+        raise ValueError(
+            f"right gripper: found {len(contact_closures)} object-contact closures, need 2"
+        )
+    cut2 = find_release_distance_cut(
+        end_states[:, 6:9], contact_release_frames[1], config
+    )
+    left_start, cut3_motor = find_sustained_arm_motion_start(
+        left_actions, left_names, config, start=cut2 + 1
+    )
+    cut3, cut3_return_motors = find_arm_stop_from_action_and_state(
+        right_actions,
+        right_joints,
+        right_names,
+        config,
+        motion_search_start=cut2 + 1,
+        motion_start_before=left_start,
+    )
+    state_cut_delay_frames = round(config.state_cut_delay_seconds * config.fps)
+    right_stable_start = cut3 - state_cut_delay_frames
+    reject_early_arm_overlap(
+        left_actions,
+        right_stable_start,
+        cut2,
+        config,
+        moving_arm="left",
+        returning_arm="right",
+    )
+    ignored_tail_frames = round(config.cut4_ignore_tail_seconds * config.fps)
+    cut4_search_start = cut3 + 1
+    cut4_search_stop = len(left_joints) - ignored_tail_frames
+    if cut4_search_stop - cut4_search_start < config.baseline_frames:
+        raise ValueError("episode is too short for cut4 tail exclusion")
+    cut4, cut4_motors = find_arm_stop_from_action_and_state(
+        left_actions,
+        left_joints,
+        left_names,
+        config,
+        motion_search_start=cut4_search_start,
+        motion_start_before=cut4_search_stop,
+    )
+    left_stable_start = cut4 - state_cut_delay_frames
+    reject_early_arm_overlap(
+        right_actions,
+        left_stable_start,
+        cut3,
+        config,
+        moving_arm="right",
+        returning_arm="left",
     )
     cuts = Cuts(cut1, cut2, cut3, cut4)
     if cuts.indices() != sorted(cuts.indices()) or len(set(cuts.indices())) != 4:
         raise ValueError(f"cut points are not strictly increasing: {cuts.indices()}")
-    return cuts, len(closures), {
-        "cut1_motor": cut1_motor,
-        "cut3_motor": cut3_motor,
-        "cut4_motors": ",".join(cut4_motors),
-    }
+    return (
+        cuts,
+        len(closures),
+        {
+            "cut1_motor": cut1_motor,
+            "cut3_return_motors": ",".join(cut3_return_motors),
+            "cut3_left_start_motor": cut3_motor,
+            "cut3_left_start_frame": str(left_start),
+            "cut4_motors": ",".join(cut4_motors),
+        },
+    )
 
 
-def write_segments(table, episode_index: int, cuts: Cuts, output: Path, overwrite: bool) -> list[str]:
+def write_segments(
+    table, episode_index: int, cuts: Cuts, output: Path, overwrite: bool
+) -> list[str]:
     boundaries = [0, *cuts.indices(), table.num_rows]
     written: list[str] = []
     episode_dir = output / "parquet" / f"episode_{episode_index:06d}"
@@ -277,7 +493,9 @@ def write_segments(table, episode_index: int, cuts: Cuts, output: Path, overwrit
     return written
 
 
-def annotation_segments(timestamps: np.ndarray, row_count: int, cuts: Cuts, fps: float) -> list[dict]:
+def annotation_segments(
+    timestamps: np.ndarray, row_count: int, cuts: Cuts, fps: float
+) -> list[dict]:
     boundaries = [0, *cuts.indices(), row_count]
     duration = row_count / fps
     segments = []
@@ -301,12 +519,18 @@ def write_csv(path: Path, rows: list[dict]) -> None:
     fields = [
         "episode_index",
         "status",
-        "cut1_frame", "cut1_time",
+        "cut1_frame",
+        "cut1_time",
         "cut1_motor",
-        "cut2_frame", "cut2_time",
-        "cut3_frame", "cut3_time",
-        "cut3_motor",
-        "cut4_frame", "cut4_time",
+        "cut2_frame",
+        "cut2_time",
+        "cut3_frame",
+        "cut3_time",
+        "cut3_return_motors",
+        "cut3_left_start_frame",
+        "cut3_left_start_motor",
+        "cut4_frame",
+        "cut4_time",
         "cut4_motors",
         "right_gripper_closures",
         "error",
@@ -356,12 +580,18 @@ def main() -> int:
             row.update(
                 {
                     "status": "ok",
-                    "cut1_frame": cuts.indices()[0], "cut1_time": cut_times[0],
+                    "cut1_frame": cuts.indices()[0],
+                    "cut1_time": cut_times[0],
                     "cut1_motor": trigger_sources["cut1_motor"],
-                    "cut2_frame": cuts.indices()[1], "cut2_time": cut_times[1],
-                    "cut3_frame": cuts.indices()[2], "cut3_time": cut_times[2],
-                    "cut3_motor": trigger_sources["cut3_motor"],
-                    "cut4_frame": cuts.indices()[3], "cut4_time": cut_times[3],
+                    "cut2_frame": cuts.indices()[1],
+                    "cut2_time": cut_times[1],
+                    "cut3_frame": cuts.indices()[2],
+                    "cut3_time": cut_times[2],
+                    "cut3_return_motors": trigger_sources["cut3_return_motors"],
+                    "cut3_left_start_frame": trigger_sources["cut3_left_start_frame"],
+                    "cut3_left_start_motor": trigger_sources["cut3_left_start_motor"],
+                    "cut4_frame": cuts.indices()[3],
+                    "cut4_time": cut_times[3],
                     "cut4_motors": trigger_sources["cut4_motors"],
                     "right_gripper_closures": closure_count,
                 }
@@ -369,8 +599,12 @@ def main() -> int:
             annotations[str(episode_index)] = annotation_segments(
                 timestamps, table.num_rows, cuts, config.fps
             )
-            files = [] if args.detect_only else write_segments(
-                table, episode_index, cuts, args.output, args.overwrite
+            files = (
+                []
+                if args.detect_only
+                else write_segments(
+                    table, episode_index, cuts, args.output, args.overwrite
+                )
             )
             details.append(
                 {
@@ -383,7 +617,7 @@ def main() -> int:
                     "split_files": files,
                 }
             )
-        except RecordingDiscontinuity as error:
+        except EpisodeQualityRejection as error:
             row["status"] = "rejected"
             row["error"] = str(error)
             print(f"  质检剔除：{row['error']}", file=sys.stderr)
@@ -404,7 +638,8 @@ def main() -> int:
             },
             ensure_ascii=False,
             indent=2,
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
     (args.output / "visualiser_segments.json").write_text(
@@ -417,7 +652,8 @@ def main() -> int:
             },
             ensure_ascii=False,
             indent=2,
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
     rejected = sum(row["status"] == "rejected" for row in rows)
