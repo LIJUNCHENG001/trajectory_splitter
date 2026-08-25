@@ -7,6 +7,7 @@ import numpy as np
 from split_trajectories import (
     Config,
     EarlyArmOverlap,
+    InsufficientReleaseDistance,
     RecordingDiscontinuity,
     find_arm_stop_from_action_and_state,
     find_gripper_closures,
@@ -109,7 +110,9 @@ class GripperClosureTest(unittest.TestCase):
         positions = np.zeros((60, 3))
         positions[41:, 0] = 0.2
 
-        with self.assertRaisesRegex(ValueError, r"0\.100m.*1\.000s"):
+        with self.assertRaisesRegex(
+            InsufficientReleaseDistance, r"0\.100m.*1\.000s"
+        ):
             find_release_distance_cut(
                 positions, release_frame=10, config=Config(fps=30, smooth_frames=1)
             )

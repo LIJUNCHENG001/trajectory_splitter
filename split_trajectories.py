@@ -59,6 +59,10 @@ class EarlyArmOverlap(EpisodeQualityRejection):
     """Raised when the other arm starts too early during an arm return."""
 
 
+class InsufficientReleaseDistance(EpisodeQualityRejection):
+    """Raised when the gripper does not visibly separate from the bread."""
+
+
 @dataclass(frozen=True)
 class Cuts:
     cut1_right_arm_mutation: int
@@ -181,7 +185,7 @@ def find_release_distance_cut(
     )
     matches = np.flatnonzero(distances >= config.cut2_release_distance)
     if not len(matches):
-        raise ValueError(
+        raise InsufficientReleaseDistance(
             "right arm: does not move "
             f"{config.cut2_release_distance:.3f}m away from bread within "
             f"{config.cut2_max_search_seconds:.3f}s after release"
